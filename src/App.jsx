@@ -1,8 +1,18 @@
-import { useState, useEffect, useRef } from 'react'
-import initWasm, { WasmOrderbook } from 'kraken-wasm'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import init, { WasmOrderbook } from '../wasm/kraken_wasm.js'
 
-const SYMBOL = 'BTC/USD'
+const SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'XRP/USD', 'ADA/USD']
 const WS_URL = 'wss://ws.kraken.com/v2'
+
+// Precision settings for each symbol (price_precision, qty_precision)
+// These match Kraken's decimal places for checksum calculation
+const SYMBOL_PRECISION = {
+  'BTC/USD': [1, 8],
+  'ETH/USD': [2, 8],
+  'SOL/USD': [2, 8],
+  'XRP/USD': [5, 8],
+  'ADA/USD': [6, 8],
+}
 
 // Color theme
 const colors = {
@@ -17,84 +27,182 @@ const colors = {
 }
 
 export default function App() {
+  const [symbol, setSymbol] = useState(SYMBOLS[0])
   const [connected, setConnected] = useState(false)
   const [bids, setBids] = useState([])
   const [asks, setAsks] = useState([])
   const [spread, setSpread] = useState(null)
   const [midPrice, setMidPrice] = useState(null)
   const [updateCount, setUpdateCount] = useState(0)
+  const [checksumValid, setChecksumValid] = useState(true)
+  const [sdkReady, setSdkReady] = useState(false)
+
+  // Refs for stable references
   const wsRef = useRef(null)
-  const orderbookRef = useRef(null)
+  const bookRef = useRef(null)
+  const messageQueueRef = useRef([])
+  const processingRef = useRef(false)
+  const currentSymbolRef = useRef(symbol)
+  const wasmInitRef = useRef(false)
 
+  // Update ref when symbol changes
   useEffect(() => {
-    let mounted = true
+    currentSymbolRef.current = symbol
+  }, [symbol])
 
-    async function connect() {
-      // Initialize WASM
-      await initWasm()
-      orderbookRef.current = new WasmOrderbook(SYMBOL)
+  // Process one message from the queue - completely sequential
+  const processNextMessage = useCallback(() => {
+    if (processingRef.current) return
+    if (messageQueueRef.current.length === 0) return
+    if (!bookRef.current) return
 
-      // Connect to Kraken WebSocket
-      const ws = new WebSocket(WS_URL)
-      wsRef.current = ws
+    processingRef.current = true
+    const msg = messageQueueRef.current.shift()
 
-      ws.onopen = () => {
-        if (!mounted) return
-        setConnected(true)
-        // Subscribe to orderbook
-        ws.send(JSON.stringify({
-          method: 'subscribe',
-          params: {
-            channel: 'book',
-            symbol: [SYMBOL],
-            depth: 25
-          }
-        }))
+    try {
+      const book = bookRef.current
+      const result = book.apply_and_get(msg, 10)
+
+      if (result && (result.msg_type === 'update' || result.msg_type === 'snapshot')) {
+        setBids(result.bids.map(l => [l.price, l.qty]))
+        setAsks(result.asks.map(l => [l.price, l.qty]))
+        setSpread(result.spread)
+        setMidPrice(result.mid_price)
+        setUpdateCount(c => c + 1)
+        setChecksumValid(true)
       }
-
-      ws.onmessage = (event) => {
-        if (!mounted) return
-
-        try {
-          const book = orderbookRef.current
-          // Apply the raw message directly - the WASM handles parsing
-          const msgType = book.apply_message(event.data)
-
-          if (msgType === 'snapshot' || msgType === 'update') {
-            // Get prices
-            const bestBid = book.get_best_bid()
-            const bestAsk = book.get_best_ask()
-
-            if (bestBid > 0 && bestAsk > 0) {
-              setMidPrice(book.get_mid_price())
-              setSpread(book.get_spread())
-            }
-
-            // Get top 10 levels
-            const topBids = book.get_top_bids(10)
-            const topAsks = book.get_top_asks(10)
-
-            // Convert to array format [price, qty]
-            setBids(topBids.map(l => [l.price, l.qty]))
-            setAsks(topAsks.map(l => [l.price, l.qty]))
-            setUpdateCount(c => c + 1)
-          }
-        } catch (e) {
-          // Ignore non-book messages
-        }
+    } catch (e) {
+      console.warn('[HAVSYN] SDK error:', e.message || e)
+      if (e.message && e.message.includes('Checksum')) {
+        setChecksumValid(false)
       }
-
-      ws.onclose = () => {
-        if (!mounted) return
-        setConnected(false)
+    } finally {
+      processingRef.current = false
+      if (messageQueueRef.current.length > 0) {
+        setTimeout(processNextMessage, 0)
       }
     }
+  }, [])
 
-    connect()
+  // Queue a message for processing
+  const queueMessage = useCallback((msg) => {
+    messageQueueRef.current.push(msg)
+    if (messageQueueRef.current.length > 100) {
+      messageQueueRef.current = messageQueueRef.current.slice(-50)
+    }
+    processNextMessage()
+  }, [processNextMessage])
+
+  // Initialize WASM once
+  useEffect(() => {
+    if (wasmInitRef.current) return
+    wasmInitRef.current = true
+
+    console.log('[HAVSYN] Initializing Havklo SDK...')
+    init().then(() => {
+      console.log('[HAVSYN] SDK initialized')
+      setSdkReady(true)
+    }).catch(err => {
+      console.error('[HAVSYN] Failed to initialize SDK:', err)
+    })
+  }, [])
+
+  // Connect to WebSocket when SDK is ready and symbol changes
+  useEffect(() => {
+    if (!sdkReady) return
+
+    let mounted = true
+
+    // Clear previous state
+    setBids([])
+    setAsks([])
+    setSpread(null)
+    setMidPrice(null)
+    setUpdateCount(0)
+    setChecksumValid(true)
+    messageQueueRef.current = []
+    processingRef.current = false
+
+    // Clean up previous orderbook
+    if (bookRef.current) {
+      try {
+        bookRef.current.free()
+      } catch (e) {
+        // Ignore
+      }
+      bookRef.current = null
+    }
+
+    // Close previous WebSocket
+    if (wsRef.current) {
+      wsRef.current.close()
+      wsRef.current = null
+    }
+
+    // Create new orderbook for this symbol
+    console.log('[HAVSYN] Creating orderbook for', symbol)
+    bookRef.current = WasmOrderbook.with_depth(symbol, 25)
+
+    // Set precision for checksum calculation
+    const [pricePrecision, qtyPrecision] = SYMBOL_PRECISION[symbol] || [2, 8]
+    bookRef.current.set_precision(pricePrecision, qtyPrecision)
+    console.log('[HAVSYN] Set precision:', pricePrecision, qtyPrecision)
+
+    // Connect to WebSocket
+    console.log('[HAVSYN] Connecting to', WS_URL)
+    const ws = new WebSocket(WS_URL)
+    wsRef.current = ws
+
+    ws.onopen = () => {
+      if (!mounted) return
+      console.log('[HAVSYN] WebSocket connected')
+      setConnected(true)
+      ws.send(JSON.stringify({
+        method: 'subscribe',
+        params: {
+          channel: 'book',
+          symbol: [symbol],
+          depth: 25
+        }
+      }))
+    }
+
+    ws.onerror = (error) => {
+      console.error('[HAVSYN] WebSocket error:', error)
+    }
+
+    ws.onmessage = (event) => {
+      if (!mounted) return
+      queueMessage(event.data)
+    }
+
+    ws.onclose = (event) => {
+      console.log('[HAVSYN] WebSocket closed:', event.code)
+      if (!mounted) return
+      setConnected(false)
+    }
 
     return () => {
       mounted = false
-      if (wsRef.current) wsRef.current.close()
+      if (ws) {
+        ws.close()
+      }
+    }
+  }, [sdkReady, symbol, queueMessage])
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (bookRef.current) {
+        try {
+          bookRef.current.free()
+        } catch (e) {
+          // Ignore
+        }
+      }
+      if (wsRef.current) {
+        wsRef.current.close()
+      }
     }
   }, [])
 
@@ -103,6 +211,13 @@ export default function App() {
     ...asks.map(a => a[1]),
     1
   )
+
+  const handleSymbolChange = (newSymbol) => {
+    if (newSymbol !== symbol) {
+      console.log('[HAVSYN] Switching to', newSymbol)
+      setSymbol(newSymbol)
+    }
+  }
 
   return (
     <div style={{
@@ -132,9 +247,24 @@ export default function App() {
             HAVSYN
           </span>
           <span style={{ color: colors.muted }}>|</span>
-          <span style={{ color: colors.text }}>{SYMBOL}</span>
+          <span style={{
+            fontSize: '10px',
+            padding: '2px 6px',
+            background: sdkReady ? colors.accent : colors.muted,
+            color: colors.bg,
+            borderRadius: '4px',
+            fontWeight: 'bold'
+          }}>
+            SDK
+          </span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+          <span style={{
+            color: checksumValid ? colors.bid : colors.ask,
+            fontSize: '11px'
+          }}>
+            {checksumValid ? 'CHECKSUM OK' : 'CHECKSUM ERR'}
+          </span>
           <span style={{
             color: connected ? colors.bid : colors.ask,
             display: 'flex',
@@ -156,16 +286,44 @@ export default function App() {
         </div>
       </header>
 
+      {/* Symbol Selector */}
+      <div style={{
+        display: 'flex',
+        gap: '8px',
+        justifyContent: 'center',
+        flexWrap: 'wrap'
+      }}>
+        {SYMBOLS.map(s => (
+          <button
+            key={s}
+            onClick={() => handleSymbolChange(s)}
+            style={{
+              padding: '8px 16px',
+              background: s === symbol ? colors.accent : colors.card,
+              color: s === symbol ? colors.bg : colors.text,
+              border: `1px solid ${s === symbol ? colors.accent : colors.border}`,
+              borderRadius: '8px',
+              cursor: 'pointer',
+              fontWeight: s === symbol ? 'bold' : 'normal',
+              fontSize: '14px',
+              transition: 'all 0.2s'
+            }}
+          >
+            {s}
+          </button>
+        ))}
+      </div>
+
       {/* Stats Bar */}
       <div style={{
         display: 'flex',
         gap: '16px',
         justifyContent: 'center'
       }}>
-        <StatCard label="Mid Price" value={midPrice ? `$${midPrice.toFixed(2)}` : '-'} />
-        <StatCard label="Spread" value={spread ? `$${spread.toFixed(2)}` : '-'} accent />
-        <StatCard label="Best Bid" value={bids[0] ? `$${bids[0][0].toFixed(2)}` : '-'} color={colors.bid} />
-        <StatCard label="Best Ask" value={asks[0] ? `$${asks[0][0].toFixed(2)}` : '-'} color={colors.ask} />
+        <StatCard label="Mid Price" value={midPrice ? `$${formatStatPrice(midPrice)}` : '-'} />
+        <StatCard label="Spread" value={spread ? `$${formatStatPrice(spread)}` : '-'} accent />
+        <StatCard label="Best Bid" value={bids[0] ? `$${formatStatPrice(bids[0][0])}` : '-'} color={colors.bid} />
+        <StatCard label="Best Ask" value={asks[0] ? `$${formatStatPrice(asks[0][0])}` : '-'} color={colors.ask} />
       </div>
 
       {/* Orderbook */}
@@ -193,15 +351,21 @@ export default function App() {
             BIDS (Buy Orders)
           </h3>
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            {bids.map(([price, qty], i) => (
-              <OrderRow
-                key={price}
-                price={price}
-                qty={qty}
-                maxQty={maxQty}
-                side="bid"
-              />
-            ))}
+            {bids.length === 0 ? (
+              <div style={{ color: colors.muted, textAlign: 'center', padding: '20px' }}>
+                Loading...
+              </div>
+            ) : (
+              bids.map(([price, qty]) => (
+                <OrderRow
+                  key={price}
+                  price={price}
+                  qty={qty}
+                  maxQty={maxQty}
+                  side="bid"
+                />
+              ))
+            )}
           </div>
         </div>
 
@@ -223,15 +387,21 @@ export default function App() {
             ASKS (Sell Orders)
           </h3>
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            {asks.map(([price, qty], i) => (
-              <OrderRow
-                key={price}
-                price={price}
-                qty={qty}
-                maxQty={maxQty}
-                side="ask"
-              />
-            ))}
+            {asks.length === 0 ? (
+              <div style={{ color: colors.muted, textAlign: 'center', padding: '20px' }}>
+                Loading...
+              </div>
+            ) : (
+              asks.map(([price, qty]) => (
+                <OrderRow
+                  key={price}
+                  price={price}
+                  qty={qty}
+                  maxQty={maxQty}
+                  side="ask"
+                />
+              ))
+            )}
           </div>
         </div>
       </div>
@@ -250,6 +420,9 @@ export default function App() {
         @keyframes pulse {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.5; }
+        }
+        button:hover {
+          opacity: 0.8;
         }
       `}</style>
     </div>
@@ -278,6 +451,19 @@ function StatCard({ label, value, accent, color }) {
       </div>
     </div>
   )
+}
+
+function formatPrice(price) {
+  if (price >= 1000) return price.toFixed(2)
+  if (price >= 1) return price.toFixed(4)
+  return price.toFixed(6)
+}
+
+function formatStatPrice(price) {
+  if (price >= 100) return price.toFixed(2)
+  if (price >= 1) return price.toFixed(4)
+  if (price >= 0.01) return price.toFixed(5)
+  return price.toFixed(6)
 }
 
 function OrderRow({ price, qty, maxQty, side }) {
@@ -313,7 +499,7 @@ function OrderRow({ price, qty, maxQty, side }) {
         fontWeight: '500',
         position: 'relative'
       }}>
-        ${price.toFixed(2)}
+        ${formatPrice(price)}
       </span>
       <span style={{
         color: colors.text,
