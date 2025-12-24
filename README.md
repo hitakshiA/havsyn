@@ -2,6 +2,8 @@
 
 A sleek, real-time cryptocurrency orderbook visualizer powered by the [Havklo SDK](https://github.com/hitakshiA/Havklo_sdk). Built to demonstrate how the SDK simplifies working with Kraken's WebSocket API.
 
+**Live Demo:** [https://havsyn.vercel.app/](https://havsyn.vercel.app/)
+
 ## What This Demonstrates
 
 I built this app to showcase the **Havklo SDK** - my Rust SDK for Kraken's trading APIs. Instead of manually parsing WebSocket messages and managing orderbook state, Havsyn uses the SDK's WASM bindings to:
